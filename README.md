@@ -7,6 +7,10 @@ with `"encrypted_function_args": []`. Codex v2 then delivers their actual messag
 text to another agent. The plugin does not rewrite opaque/encrypted arguments,
 other tools, other models, or WebSocket frames.
 
+On the inbound side, it converts plaintext Codex `agent_message` items into
+ordinary user messages so an OpenAI-compatible OSS backend actually receives the
+child task. Mixed or encrypted-content agent messages remain untouched.
+
 It also maps a raw Responses request's `reasoning.effort: "ultra"` to `high`
 for GLM Flash or `max` for GLM Cyber. Current Codex already resolves `ultra`
 locally before the request; the request hook only helps clients that send it raw.

@@ -83,6 +83,57 @@ func rewriteEffort(body []byte, fallback string) []byte {
 	return updated
 }
 
+func rewriteAgentMessageInput(body []byte) []byte {
+	var request map[string]json.RawMessage
+	if json.Unmarshal(body, &request) != nil {
+		return nil
+	}
+	var input []json.RawMessage
+	if json.Unmarshal(request["input"], &input) != nil {
+		return nil
+	}
+	changed := false
+	for i, rawItem := range input {
+		var item map[string]json.RawMessage
+		if json.Unmarshal(rawItem, &item) != nil {
+			continue
+		}
+		var kind string
+		if json.Unmarshal(item["type"], &kind) != nil || kind != "agent_message" {
+			continue
+		}
+		var content []map[string]json.RawMessage
+		if json.Unmarshal(item["content"], &content) != nil || len(content) == 0 {
+			continue
+		}
+		plaintext := true
+		for _, part := range content {
+			var partType, text string
+			if json.Unmarshal(part["type"], &partType) != nil || partType != "input_text" ||
+				json.Unmarshal(part["text"], &text) != nil {
+				plaintext = false
+				break
+			}
+		}
+		if !plaintext {
+			continue
+		}
+		item["type"] = json.RawMessage(`"message"`)
+		item["role"] = json.RawMessage(`"user"`)
+		delete(item, "author")
+		delete(item, "recipient")
+		delete(item, "internal_chat_message_metadata_passthrough")
+		input[i], _ = json.Marshal(item)
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	request["input"], _ = json.Marshal(input)
+	updated, _ := json.Marshal(request)
+	return updated
+}
+
 func collaborationName(item map[string]any) bool {
 	name, _ := item["name"].(string)
 	namespace, _ := item["namespace"].(string)
@@ -201,6 +252,23 @@ func frameBoundary(b []byte) int {
 	return -1
 }
 
+func completeUndelimitedEvent(frame []byte) bool {
+	// CLIProxyAPI also accepts and forwards a complete JSON data line without
+	// the blank-line terminator. Do not hold such an event until stream close.
+	var payload []byte
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		if payload != nil {
+			return false
+		}
+		payload = bytes.TrimSpace(line[len("data:"):])
+	}
+	return len(payload) > 0 && (json.Valid(payload) || bytes.Equal(payload, []byte("[DONE]")))
+}
+
 func rewriteChunk(req chunkIntercept) (body []byte, drop bool) {
 	if req.ChunkIndex < 0 || !isResponses(req.SourceFormat) {
 		return nil, false
@@ -230,6 +298,10 @@ func rewriteChunk(req chunkIntercept) (body []byte, drop bool) {
 		}
 		output = append(output, rewriteFrame(state.pending[:end])...)
 		state.pending = state.pending[end:]
+	}
+	if completeUndelimitedEvent(state.pending) {
+		output = append(output, rewriteFrame(state.pending)...)
+		state.pending = nil
 	}
 	if len(state.pending) > maxPendingFrame {
 		state.passthrough = true

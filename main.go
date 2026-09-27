@@ -117,8 +117,20 @@ func handleMethod(method string, raw []byte) (any, error) {
 		if !ok {
 			return struct{}{}, nil
 		}
-		if updated := rewriteEffort(req.Body, fallback); len(updated) > 0 {
-			return struct{ Body []byte }{updated}, nil
+		body := req.Body
+		changed := false
+		if method == "request.intercept_before" {
+			if updated := rewriteAgentMessageInput(body); len(updated) > 0 {
+				body = updated
+				changed = true
+			}
+		}
+		if updated := rewriteEffort(body, fallback); len(updated) > 0 {
+			body = updated
+			changed = true
+		}
+		if changed {
+			return struct{ Body []byte }{body}, nil
 		}
 		return struct{}{}, nil
 	case "response.intercept_after":

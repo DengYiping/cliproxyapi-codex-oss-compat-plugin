@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -22,7 +23,11 @@ func marker(t *testing.T, raw []byte, path ...string) any {
 		case map[string]any:
 			value = node[part]
 		case []any:
-			value = node[0]
+			index, err := strconv.Atoi(part)
+			if err != nil || index < 0 || index >= len(node) {
+				t.Fatalf("invalid array index %q", part)
+			}
+			value = node[index]
 		default:
 			t.Fatalf("unexpected JSON node %T at %q", node, part)
 		}
@@ -103,6 +108,21 @@ func TestSSEFragmentsAndUnrelatedEvents(t *testing.T) {
 	}
 }
 
+func TestSSEUndelimitedCompleteEvent(t *testing.T) {
+	id := "undelimited-test"
+	defer releaseStream(id)
+	body := []byte(`event: response.output_item.done` + "\n" + `data: {"type":"response.output_item.done","item":{"type":"function_call","namespace":"collaboration","name":"send_message","arguments":"{\"target\":\"child\",\"message\":\"hello\"}","call_id":"c"}}`)
+	updated, drop := rewriteChunk(chunkIntercept{RequestID: id, SourceFormat: "openai-response", Model: "glm-5.3-flash", ChunkIndex: 0, Body: body})
+	if drop || !bytes.Contains(updated, []byte(`"encrypted_function_args":[]`)) {
+		t.Fatalf("complete event without blank line must be delivered: drop=%v body=%q", drop, updated)
+	}
+	// A later terminator must not cause the already-delivered event to repeat.
+	ending, drop := rewriteChunk(chunkIntercept{RequestID: id, SourceFormat: "openai-response", Model: "glm-5.3-flash", ChunkIndex: 1, Body: []byte("\n\n")})
+	if drop || string(ending) != "\n\n" {
+		t.Fatalf("delimiter was not preserved: drop=%v body=%q", drop, ending)
+	}
+}
+
 func TestUltraFallbackAndAllowlist(t *testing.T) {
 	for _, tc := range []struct{ model, want string }{{"glm-5.3-flash", "high"}, {"glm-5.3-cyber", "max"}} {
 		fallback, ok := supported(tc.model, "")
@@ -125,6 +145,41 @@ func TestUltraFallbackAndAllowlist(t *testing.T) {
 	}
 }
 
+func TestPlaintextChildInputBecomesUserMessage(t *testing.T) {
+	input := []byte(`{"model":"glm-5.3-flash","input":[{"type":"agent_message","author":"/root","recipient":"/root/child","content":[{"type":"input_text","text":"Message Type: NEW_TASK\\nPayload: 42"}],"internal_chat_message_metadata_passthrough":{"turn_id":"1"}},{"type":"message","role":"developer","content":[{"type":"input_text","text":"rules"}]}]}`)
+	updated := rewriteAgentMessageInput(input)
+	if got := marker(t, updated, "input", "0", "type"); got != "message" {
+		t.Fatalf("child message type = %v", got)
+	}
+	if got := marker(t, updated, "input", "0", "role"); got != "user" {
+		t.Fatalf("child message role = %v", got)
+	}
+	if got := marker(t, updated, "input", "0", "content", "0", "text"); !strings.Contains(got.(string), "Payload: 42") {
+		t.Fatalf("child payload was lost: %v", got)
+	}
+	if marker(t, updated, "input", "0", "author") != nil || marker(t, updated, "input", "0", "recipient") != nil {
+		t.Fatal("internal routing metadata leaked to upstream user message")
+	}
+	if got := marker(t, updated, "input", "1", "role"); got != "developer" {
+		t.Fatalf("second item changed: %v", got)
+	}
+	if rewriteAgentMessageInput(updated) != nil {
+		t.Fatal("second pass should be byte-preserving")
+	}
+}
+
+func TestEncryptedChildInputIsUntouched(t *testing.T) {
+	for _, content := range []string{
+		`[{"type":"encrypted_content","encrypted_content":"opaque"}]`,
+		`[{"type":"input_text","text":"heading"},{"type":"encrypted_content","encrypted_content":"opaque"}]`,
+	} {
+		input := []byte(`{"input":[{"type":"agent_message","author":"/root","content":` + content + `}]}`)
+		if updated := rewriteAgentMessageInput(input); updated != nil {
+			t.Fatalf("encrypted content was changed: %s", updated)
+		}
+	}
+}
+
 func TestRPCEnvelopeAndScope(t *testing.T) {
 	registration, err := handleMethod("plugin.register", nil)
 	if err != nil {
@@ -142,6 +197,28 @@ func TestRPCEnvelopeAndScope(t *testing.T) {
 	raw, _ := json.Marshal(result)
 	if got := marker(t, raw, "Body"); got == nil {
 		t.Fatal("request hook failed to return a body")
+	} else {
+		var body []byte
+		if err := json.Unmarshal(raw, &struct{ Body *[]byte }{Body: &body}); err != nil {
+			t.Fatal(err)
+		}
+		if effort := marker(t, body, "reasoning", "effort"); effort != "high" {
+			t.Fatalf("raw ultra did not map to high: %v", effort)
+		}
+	}
+	child := []byte(`{"model":"glm-5.3-flash","input":[{"type":"agent_message","author":"/root","recipient":"/root/child","content":[{"type":"input_text","text":"task marker"}]}]}`)
+	reqJSON, _ := json.Marshal(requestIntercept{SourceFormat: "openai-response", Model: "glm-5.3-flash", Body: child})
+	result, err = handleMethod("request.intercept_before", reqJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = json.Marshal(result)
+	var converted struct{ Body []byte }
+	if err := json.Unmarshal(raw, &converted); err != nil {
+		t.Fatal(err)
+	}
+	if role := marker(t, converted.Body, "input", "0", "role"); role != "user" {
+		t.Fatalf("child task was not converted for upstream: %v", role)
 	}
 	unrelated := []byte(`{"SourceFormat":"chat-completions","Model":"glm-5.3-flash","Body":"eyJyZWFzb25pbmciOnsiZWZmb3J0IjoidWx0cmEifX0="}`)
 	result, err = handleMethod("request.intercept_before", unrelated)
