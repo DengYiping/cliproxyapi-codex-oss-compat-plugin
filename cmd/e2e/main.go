@@ -33,6 +33,8 @@ func main() {
 	model := flag.String("model", "glm-5.3-flash", "model served by the local proxy")
 	effort := flag.String("effort", "medium", "Codex reasoning effort (medium or ultra)")
 	timeout := flag.Duration("timeout", 180*time.Second, "deadline for the full Codex run")
+	websocket := flag.Bool("websocket", false, "force Codex to use the provider's Responses WebSocket transport")
+	provider := flag.String("provider", "cliproxy", "Codex model provider to configure when -websocket is set")
 	flag.Parse()
 
 	nonce := make([]byte, 6)
@@ -41,7 +43,7 @@ func main() {
 	}
 	runID := hex.EncodeToString(nonce)
 	expected := "42:" + runID
-	fmt.Printf("run=%s model=%s effort=%s expected=%s\n", runID, *model, *effort, expected)
+	fmt.Printf("run=%s model=%s effort=%s websocket=%t expected=%s\n", runID, *model, *effort, *websocket, expected)
 
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -50,7 +52,12 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 	prompt := fmt.Sprintf("Delegate exactly one task via collaboration.spawn_agent: compute 17 + 25 and reply with exactly %s. The child must give that exact reply; wait for it and then answer with the child's exact reply. Do not use shell tools or edit files.", expected)
-	cmd := exec.CommandContext(ctx, "codex", "exec", "--json", "--skip-git-repo-check", "-s", "read-only", "--enable", "multi_agent_v2", "-m", *model, "-c", "model_reasoning_effort="+*effort, "-C", cwd, prompt)
+	args := []string{"exec", "--json", "--skip-git-repo-check", "-s", "read-only", "--enable", "multi_agent_v2", "-m", *model, "-c", "model_reasoning_effort=" + *effort}
+	if *websocket {
+		args = append(args, "-c", "model_providers."+*provider+".supports_websockets=true")
+	}
+	args = append(args, "-C", cwd, prompt)
+	cmd := exec.CommandContext(ctx, "codex", args...)
 	// Codex can leave child MCP processes holding stdout open after the deadline.
 	cmd.WaitDelay = 2 * time.Second
 	var stdout, stderr bytes.Buffer

@@ -88,16 +88,20 @@ func cliproxyPluginFree(ptr unsafe.Pointer, _ C.size_t) {
 func cliproxyPluginShutdown() {
 	streams.Lock()
 	streams.items = make(map[string]*streamState)
+	streams.quiescing = false
+	streams.drainEpoch++
+	streamChanges.Broadcast()
 	streams.Unlock()
 }
 
 func handleMethod(method string, raw []byte) (any, error) {
 	switch method {
 	case "plugin.register", "plugin.reconfigure":
+		resumeSearchRequests()
 		return map[string]any{
 			"schema_version": 6,
 			"metadata": map[string]any{
-				"Name": "codex-oss-compat", "Version": "0.1.0", "Author": "local",
+				"Name": "codex-oss-compat", "Version": "0.1.5", "Author": "local",
 				"GitHubRepository": "https://github.com/router-for-me/CLIProxyAPI", "ConfigFields": []any{},
 			},
 			"capabilities": map[string]bool{
@@ -105,6 +109,9 @@ func handleMethod(method string, raw []byte) (any, error) {
 				"response_interceptor": true, "response_stream_interceptor": true,
 			},
 		}, nil
+	case "plugin.quiesce":
+		quiesceSearchRequests()
+		return struct{}{}, nil
 	case "request.intercept_before", "request.intercept_after":
 		var req requestIntercept
 		if err := json.Unmarshal(raw, &req); err != nil {
@@ -114,11 +121,37 @@ func handleMethod(method string, raw []byte) (any, error) {
 			return struct{}{}, nil
 		}
 		fallback, ok := supported(req.Model, req.RequestedModel)
-		if !ok {
-			return struct{}{}, nil
+		body := req.Body
+		changed := false
+		if ok && method == "request.intercept_before" {
+			if updated := rewriteAgentMessageInput(body); len(updated) > 0 {
+				body = updated
+				changed = true
+			}
 		}
-		if updated := rewriteEffort(req.Body, fallback); len(updated) > 0 {
-			return struct{ Body []byte }{updated}, nil
+		if ok {
+			if updated := rewriteEffort(body, fallback); len(updated) > 0 {
+				body = updated
+				changed = true
+			}
+		}
+		if method == "request.intercept_after" && searchSupported(req.Model, req.RequestedModel) && req.ToFormat == "claude" {
+			req.Body = body
+			updated, reject := interceptSearchRequest(req)
+			if reject {
+				return struct {
+					Terminate    bool
+					StatusCode   int
+					ResponseBody []byte
+				}{true, 503, []byte(`{"error":{"type":"server_error","code":"plugin_reloading","message":"Tool discovery compatibility is draining for a plugin reload. Retry after the reload finishes."}}`)}, nil
+			}
+			if len(updated) > 0 {
+				body = updated
+				changed = true
+			}
+		}
+		if changed {
+			return struct{ Body []byte }{body}, nil
 		}
 		return struct{}{}, nil
 	case "response.intercept_after":
@@ -127,10 +160,21 @@ func handleMethod(method string, raw []byte) (any, error) {
 			return nil, fmt.Errorf("decode response interceptor: %w", err)
 		}
 		if isResponses(req.SourceFormat) {
+			original := req.Body
+			body := req.Body
 			if _, ok := supported(req.Model, req.RequestedModel); ok {
-				if updated := rewriteResponse(req.Body); len(updated) > 0 {
-					return struct{ Body []byte }{updated}, nil
+				if updated := rewriteResponse(body); len(updated) > 0 {
+					body = updated
 				}
+			}
+			if searchSupported(req.Model, req.RequestedModel) {
+				req.Body = body
+				if updated := interceptSearchResponse(req); len(updated) > 0 {
+					body = updated
+				}
+			}
+			if len(body) > 0 && string(body) != string(original) {
+				return struct{ Body []byte }{body}, nil
 			}
 		}
 		return struct{}{}, nil
