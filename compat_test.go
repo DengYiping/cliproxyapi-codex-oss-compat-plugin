@@ -123,8 +123,58 @@ func TestSSEUndelimitedCompleteEvent(t *testing.T) {
 	}
 }
 
+func TestRawJSONChunksFromWebSocketStream(t *testing.T) {
+	id := "websocket-json-test"
+	defer releaseStream(id)
+	item := `{"type":"response.output_item.done","item":{"type":"function_call","namespace":"collaboration","name":"spawn_agent","arguments":"{\"message\":\"hello\"}","call_id":"c"}}`
+	req := chunkIntercept{RequestID: id, SourceFormat: "openai-response", Model: "glm-5.3-flash", ChunkIndex: 0, Body: []byte(item)}
+	body, drop := rewriteChunk(req)
+	if drop || !bytes.Contains(body, []byte(`"encrypted_function_args":[]`)) || bytes.HasPrefix(body, []byte("data:")) {
+		t.Fatalf("complete raw JSON event body=%q drop=%v", body, drop)
+	}
+
+	req.ChunkIndex++
+	req.Body = []byte(item[:len(item)/2])
+	if body, drop := rewriteChunk(req); len(body) != 0 || !drop {
+		t.Fatalf("partial raw JSON event body=%q drop=%v", body, drop)
+	}
+	req.ChunkIndex++
+	req.Body = []byte(item[len(item)/2:] + "\n" + `{"type":"response.created","response":{"id":"r"}}`)
+	body, drop = rewriteChunk(req)
+	if drop || !bytes.Contains(body, []byte(`"encrypted_function_args":[]`)) || !bytes.HasSuffix(body, []byte("\n"+`{"type":"response.created","response":{"id":"r"}}`)) {
+		t.Fatalf("split and batched raw JSON events body=%q drop=%v", body, drop)
+	}
+
+	unrelated := []byte(`{"type":"response.created","response":{"id":"r2"}}`)
+	req.ChunkIndex++
+	req.Body = unrelated
+	if body, drop := rewriteChunk(req); drop || !bytes.Equal(body, unrelated) {
+		t.Fatalf("unrelated raw JSON event body=%q drop=%v", body, drop)
+	}
+}
+
+func TestInvalidRawJSONStreamPassesThrough(t *testing.T) {
+	id := "websocket-invalid-json-test"
+	defer releaseStream(id)
+	req := chunkIntercept{RequestID: id, SourceFormat: "openai-response", Model: "glm-5.3-flash", Body: []byte(`{"type":]`)}
+	if body, drop := rewriteChunk(req); drop || string(body) != `{"type":]` {
+		t.Fatalf("invalid raw JSON body=%q drop=%v", body, drop)
+	}
+	req.ChunkIndex++
+	req.Body = []byte(`{"type":"response.created"}`)
+	if body, drop := rewriteChunk(req); drop || len(body) != 0 {
+		t.Fatalf("passthrough stream should leave later chunks unchanged: body=%q drop=%v", body, drop)
+	}
+}
+
 func TestUltraFallbackAndAllowlist(t *testing.T) {
-	for _, tc := range []struct{ model, want string }{{"glm-5.3-flash", "high"}, {"glm-5.3-cyber", "max"}} {
+	for _, tc := range []struct{ model, want string }{
+		{"kimi-k3", "high"},
+		{"glm-5.3", "high"},
+		{"glm-5.3-flash", "high"},
+		{"glm-5.3-cyber", "max"},
+		{"claude-opus-5-5", "xhigh"},
+	} {
 		fallback, ok := supported(tc.model, "")
 		if !ok {
 			t.Fatalf("model %q not allowed", tc.model)
