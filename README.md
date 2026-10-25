@@ -2,10 +2,11 @@
 
 A small native C-ABI plugin for CLIProxyAPI's Responses path. For the
 allowlisted models `kimi-k3`, `glm-5.3`, `glm-5.3-flash`, `glm-5.3-cyber`, and
+`deepseek-v4.1-flash-cyber` (or upstream `DeepSeek-V4.1-Flash-1017`), and
 `claude-opus-5-5`, it marks plaintext
 `collaboration.spawn_agent`, `send_message`, and `followup_task` function calls
 with `"encrypted_function_args": []`. Codex v2 then delivers their actual message
-text to another agent. Except for the Claude discovery bridge below, the plugin
+text to another agent. Except for the discovery bridges below, the plugin
 does not rewrite opaque/encrypted arguments, other tools, or other models.
 
 On the inbound side, it converts plaintext Codex `agent_message` items into
@@ -13,11 +14,11 @@ ordinary user messages so an OpenAI-compatible OSS backend actually receives the
 child task. Mixed or encrypted-content agent messages remain untouched.
 
 It also maps a raw Responses request's `reasoning.effort: "ultra"` to `high`
-for Kimi K3 and the GLM 5.3 models, `max` for GLM Cyber, or `xhigh` for Claude
+for Kimi K3 and the GLM 5.3 models, `max` for GLM Cyber and DeepSeek, or `xhigh` for Claude
 Opus 5.5. Current Codex already resolves `ultra`
 locally before the request; the request hook only helps clients that send it raw.
 
-Build on macOS with `go build -buildmode=c-shared -o dist/codex-oss-compat-v0.1.5.dylib .`
+Build on macOS with `go build -buildmode=c-shared -o dist/codex-oss-compat-v0.1.8.dylib .`
 after creating `dist/`. Place the versioned library at the configured CLIProxyAPI plugin
 directory under `darwin/arm64/`. A new filename permits the running host to
 hot-load this version. From v0.1.5 onward, the plugin drains its active discovery
@@ -31,6 +32,9 @@ plugins:
   configs:
     codex-oss-compat:
       enabled: true
+      priority: 95 # Before the DeepSeek reasoning adapter (priority 90).
+      store:
+        version: 0.1.8
 ```
 
 The executable `go run ./cmd/e2e -model glm-5.3-flash -timeout 180s` drives a
@@ -93,6 +97,48 @@ requests manually first. Disabling/unloading the plugin outright is not a
 quiesced replacement and likewise requires a manual drain. The existing
 effort/collaboration allowlists are not expanded to the other Claude aliases.
 
+## Cache-stable client discovery for DeepSeek
+
+Version 0.1.8 extends client discovery to `deepseek-v4.1-flash-cyber` and
+`DeepSeek-V4.1-Flash-1017`, only on the OpenAI-compatible (`openai`) upstream
+format. Activation still requires an explicit client-executed `tool_search`
+declaration. Other models and DeepSeek requests without search are untouched.
+
+Unlike the Claude bridge, **discovered schemas are not added to top-level tools**.
+The initial resident tools retain their order, followed by a stable search shim
+and `codex_deferred_tool` dispatcher. Full discovered schemas stay in their
+original search-result messages, where the model can read them. Resent loaded
+schemas, including Responses Lite `additional_tools`, do not grow the tool prefix.
+Neither instructions, cache keys, nor existing result messages are rewritten as
+new tools are discovered. Shim-name collisions are resolved using only resident
+tools, not the changing discovery set.
+
+The model invokes the dispatcher with the discovered tool's name, optional
+namespace, and argument object (or string `input` for a custom tool). Response
+hooks restore the real Codex function/custom call and its IDs. Codex executes
+the tool through its normal handler and approval rules; the plugin never executes
+tools itself. Replay converts those calls back into stable dispatch history.
+Arguments are buffered until the target name is known, so clients never see a
+partially named dispatch call. SSE and raw-JSON WebSocket streams are supported.
+Malformed, oversized, or undiscovered dispatches fail closed, rather than
+executing the shim. Definitions are rebuilt from each request's discovery history;
+there is no persistent or cross-chat tool registry. Client search after compaction
+must rediscover schemas no longer present in the request.
+
+This preserves the static tool prefix and append-only conversation prefix during
+discovery. It does not guarantee a cache hit after unrelated instructions, resident
+tools, model/template, or conversation history change (including compaction), or
+when the serving process evicts cache blocks. Discovered schemas and their results
+still occupy history; this is lazy loading, not zero-cost tool descriptions.
+Function argument schemas are model-visible in the results, not enforced as
+individual upstream tool schemas; Codex remains the execution/validation boundary.
+
+After building, install a new versioned regular file and update the version pin
+using the hot-reload procedure below. Enable `supports_search_tool: true` for the
+exact DeepSeek model in your Codex catalog **only after** the native end-to-end
+probe passes. Building/testing alone does not change your installed plugin or
+global catalog. Keep the previous library/pin and catalog for rollback.
+
 ## Validation
 
 ```sh
@@ -101,10 +147,14 @@ go test -race ./...
 go vet ./...
 CPA_SOURCE=/Users/ydeng/src/cliproxyapi go test -v -run TestCPAClientSearchRoundTrip .
 mkdir -p dist
-go build -buildmode=c-shared -o dist/codex-oss-compat-v0.1.5.dylib .
+go build -buildmode=c-shared -o dist/codex-oss-compat-v0.1.8.dylib .
 CPA_SOURCE=/Users/ydeng/src/cliproxyapi \
-COMPAT_PLUGIN_LIBRARY="$PWD/dist/codex-oss-compat-v0.1.5.dylib" \
+COMPAT_PLUGIN_LIBRARY="$PWD/dist/codex-oss-compat-v0.1.8.dylib" \
 go test -v -run TestCPANativePluginDrain .
+
+# Fixed tools and append-only messages through CPA's real DeepSeek translator.
+CPA_SOURCE=/Users/ydeng/src/CLIProxyAPI \
+go test -v -run TestCPADeepSeekPrefixAndDispatchRoundTrip .
 ```
 
 The dependency-free tests cover SSE/CRLF and bare JSON, single-byte fragments,
@@ -137,12 +187,22 @@ to a comma-separated subset if desired. Only loopback endpoints are accepted;
 credentials, account identifiers, response bodies, and request logs are not
 printed.
 
+For DeepSeek, set `COMPAT_LIVE_MODELS=deepseek-v4.1-flash-cyber` on that probe.
+`TestLiveDeepSeekPrefixCache` sends two synthetic requests with a stable long
+prefix and a new discovery/user turn. It asserts at least 1,024 reported cached
+tokens when available. Some serving configurations report zero in API usage even
+when their prefix cache is active: the cache assertion then skips explicitly;
+it does not claim a successful cache measurement. Inspect the upstream
+`vllm:prefix_cache_hits_total`/`prefix_cache_queries_total` deltas and request
+counts to corroborate reuse. `COMPAT_REQUIRE_REPORTED_CACHE=1` makes unavailable
+or insufficient reported reuse a hard failure. No server configuration is changed.
+
 Native end-to-end probe using actual Codex local search and a read-only fake MCP
 server (requires `codex` and `cliproxyapi` on PATH):
 
 ```sh
 COMPAT_CODEX_E2E=1 \
-COMPAT_PLUGIN_LIBRARY=/Users/ydeng/src/cliproxyapi-codex-oss-compat-plugin/dist/codex-oss-compat-v0.1.5.dylib \
+COMPAT_PLUGIN_LIBRARY=/Users/ydeng/src/cliproxyapi-codex-oss-compat-plugin/dist/codex-oss-compat-v0.1.8.dylib \
 COMPAT_MODEL_CATALOG=/Users/ydeng/.codex/models.cliproxy.json \
 CPA_CLIENT_KEY_FILE=/Users/ydeng/.cli-proxy-api/client-key \
 go test -v -run TestNativeCodexClientSearch .
@@ -158,6 +218,19 @@ not restarted. `COMPAT_CODEX_MODEL` chooses another allowlisted alias. Reasoning
 is disabled in this double-proxy probe because that staged path rejects adaptive
 thinking; reasoning-enabled live behavior is not certified by this test. Temporary
 hosts, credentials, catalogs, and session records are cleaned up afterwards.
+Set `COMPAT_CODEX_MODEL=deepseek-v4.1-flash-cyber` to exercise the DeepSeek bridge.
+Only the temporary catalog advertises search for the candidate.
+
+DeepSeek validation, October 25, 2026: unit/race/vet, real CPA request translator
+prefix tests, and live SSE search followed by nonstream dispatch passed. An actual
+Codex run with the candidate native library completed two searches and two echo
+MCP invocations over each of HTTP/SSE and WebSocket. The native drain/replacement
+fixture and existing Claude translator round trip passed. API usage returned zero
+cached tokens, so the per-request cache-hit assertion was not certified. Read-only
+vLLM metrics showed active prefix-cache reuse, but concurrent serving traffic
+prevented attributing those counter increases specifically to this probe. The
+cache-preservation claim is therefore limited to the tested fixed-tool and
+append-only-message prefix invariants, not a measured per-request hit rate.
 
 Live validation record for v0.1.4, September 30, 2026 (not rerun for v0.1.5):
 
@@ -183,17 +256,18 @@ Live validation record for v0.1.4, September 30, 2026 (not rerun for v0.1.5):
 
 1. Build the versioned library above. Keep the prior installed version available.
 2. Copy the **regular file**, not a symlink, to
-   `/Users/ydeng/.cli-proxy-api/plugins/darwin/arm64/codex-oss-compat-v0.1.5.dylib`.
+   `/Users/ydeng/.cli-proxy-api/plugins/darwin/arm64/codex-oss-compat-v0.1.8.dylib`.
    Do not overwrite a loaded library. The current CPA loader selects the highest
    version unless pinned; confirm its Plugins UI/management API reports version
-   `0.1.5`, with request, response, stream, and lifecycle interceptors enabled.
+   `0.1.8`, with request, response, stream, and lifecycle interceptors enabled.
    If `plugins.configs.codex-oss-compat.store.version` is pinned, update that pin
    explicitly. A versioned hot reload does not require restarting CPA. Drain
    bridged requests manually if the outgoing version predates v0.1.5; subsequent
    replacements use automatic quiescing on a CPA host supporting that hook.
 3. Back up `/Users/ydeng/.codex/models.cliproxy.json`. Set
    `supports_search_tool` to `true` **only** on the existing entries whose exact
-   slugs are `claude-opus-5-5`, `claude-opus-4-8`, and `claude-fable-5-1`.
+   slugs are `claude-opus-5-5`, `claude-opus-4-8`, `claude-fable-5-1`, or
+   `deepseek-v4.1-flash-cyber` (only the alias being rolled out).
    Leave every other catalog field and model unchanged. No Anthropic native
    search/defer-loading setting or route change is required.
    Gate each alias on its native probe: enable Opus 5.5/Fable 5.1 first; keep
@@ -203,6 +277,6 @@ Live validation record for v0.1.4, September 30, 2026 (not rerun for v0.1.5):
    confirm the session contains client `tool_search_call`, `tool_search_output`,
    and the discovered tool invocation. Schemas must be absent before discovery
    and available afterwards.
-5. To roll back, restore the three flags first, then pin the prior plugin version
+5. To roll back, restore the changed catalog flags first, then pin the prior plugin version
    or move only the new versioned library out of the watched directory. Retain
    both libraries for recovery; do not delete session history.

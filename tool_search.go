@@ -25,6 +25,9 @@ func decodeJSON(body []byte, value any) error {
 // This is a client-side protocol bridge, not Anthropic's native tool search.
 // Only an advertised execution=client search enables response rewriting.
 func searchSupported(model, requested string) bool {
+	if deepSeekSearch(model, requested) {
+		return true
+	}
 	if requested != "" {
 		model = requested
 	}
@@ -39,10 +42,12 @@ type searchBridge struct {
 	name     string
 	calls    map[string]*searchCall
 	buffered int
+	dispatch *deferredDispatch
 }
 
 type searchCall struct {
 	arguments string
+	item      map[string]any
 }
 
 func stringField(item map[string]any, key string) string {
@@ -310,11 +315,20 @@ func callKeys(payload map[string]any, item map[string]any) []string {
 }
 
 func (bridge *searchBridge) rewritePayload(body []byte) ([]byte, bool) {
+	dispatchChanged := false
+	if bridge.dispatch != nil {
+		if updated, handled, drop := bridge.rewriteDispatchPayload(body); handled {
+			if drop {
+				return nil, true
+			}
+			body, dispatchChanged = updated, true
+		}
+	}
 	var payload map[string]any
 	if decodeJSON(body, &payload) != nil {
 		return nil, false
 	}
-	changed := false
+	changed := dispatchChanged
 	switch payload["type"] {
 	case "response.created":
 		bridge.calls = make(map[string]*searchCall)

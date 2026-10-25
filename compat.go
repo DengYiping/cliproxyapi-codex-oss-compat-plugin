@@ -12,11 +12,13 @@ import (
 // Only models whose plaintext collaboration calls need the v2 marker are changed.
 // The effort fallback follows the supported levels in the local Codex model catalog.
 var effortFallback = map[string]string{
-	"kimi-k3":         "high",
-	"glm-5.3":         "high",
-	"glm-5.3-flash":   "high",
-	"glm-5.3-cyber":   "max",
-	"claude-opus-5-5": "xhigh",
+	"kimi-k3":                   "high",
+	"glm-5.3":                   "high",
+	"glm-5.3-flash":             "high",
+	"glm-5.3-cyber":             "max",
+	"claude-opus-5-5":           "xhigh",
+	"deepseek-v4.1-flash-cyber": "max",
+	"deepseek-v4.1-flash-1017":  "max",
 }
 
 const maxPendingFrame = 1 << 20
@@ -313,6 +315,22 @@ func rewriteFrameWith(frame []byte, rewrite payloadRewriter) []byte {
 	if hasCR {
 		lines[dataLine] = append(lines[dataLine], '\r')
 	}
+	// Dispatch can delay an added item until arguments.done. Keep a named SSE
+	// event consistent with the rewritten JSON type (data-only SSE is unchanged).
+	var event, originalEvent struct {
+		Type string `json:"type"`
+	}
+	_ = json.Unmarshal(bytes.TrimSpace(line[len("data:"):]), &originalEvent)
+	if json.Unmarshal(updated, &event) == nil && event.Type != "" && event.Type != originalEvent.Type {
+		for i, line := range lines {
+			if bytes.HasPrefix(line, []byte("event:")) {
+				lines[i] = []byte("event: " + event.Type)
+				if bytes.HasSuffix(line, []byte("\r")) {
+					lines[i] = append(lines[i], '\r')
+				}
+			}
+		}
+	}
 	return bytes.Join(lines, []byte("\n"))
 }
 
@@ -510,6 +528,9 @@ func (state *streamState) failStream(code, message string) []byte {
 	state.pending = nil
 	state.search.calls = make(map[string]*searchCall)
 	state.search.buffered = 0
+	if state.search.dispatch != nil {
+		state.search.dispatch.calls = make(map[string]*searchCall)
+	}
 	response := map[string]any{
 		"object": "response", "status": "failed", "output": []any{},
 		"error": map[string]any{"type": "server_error", "code": code, "message": message},
@@ -535,15 +556,22 @@ func interceptSearchRequest(req requestIntercept) (updated []byte, reject bool) 
 		previous = state.search
 	}
 	updated, bridge := rewriteSearchRequest(req.Body, previous)
+	if deepSeekSearch(req.Model, req.RequestedModel) && len(updated) > 0 {
+		updated, bridge = rewriteDeepSeekSearch(req.Body, updated, bridge)
+	}
 	if bridge != nil && streams.quiescing && previous == nil {
 		return nil, true
 	}
 	if bridge != nil && req.RequestID != "" {
+		var dispatch *deferredDispatch
+		if bridge.dispatch != nil {
+			dispatch = &deferredDispatch{name: bridge.dispatch.name, tools: bridge.dispatch.tools, only: bridge.dispatch.only, calls: make(map[string]*searchCall)}
+		}
 		_, collaboration := supported(req.Model, req.RequestedModel)
 		// The lifecycle ID survives upstream retries; parser framing, pending
 		// bytes, failure flags, and argument tracking belong to one attempt only.
 		streams.items[req.RequestID] = &streamState{
-			search:        &searchBridge{name: bridge.name, calls: make(map[string]*searchCall)},
+			search:        &searchBridge{name: bridge.name, calls: make(map[string]*searchCall), dispatch: dispatch},
 			collaboration: collaboration,
 		}
 	}

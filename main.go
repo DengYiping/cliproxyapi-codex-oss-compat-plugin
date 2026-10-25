@@ -101,7 +101,7 @@ func handleMethod(method string, raw []byte) (any, error) {
 		return map[string]any{
 			"schema_version": 6,
 			"metadata": map[string]any{
-				"Name": "codex-oss-compat", "Version": "0.1.5", "Author": "local",
+				"Name": "codex-oss-compat", "Version": "0.1.8", "Author": "local",
 				"GitHubRepository": "https://github.com/router-for-me/CLIProxyAPI", "ConfigFields": []any{},
 			},
 			"capabilities": map[string]bool{
@@ -135,7 +135,7 @@ func handleMethod(method string, raw []byte) (any, error) {
 				changed = true
 			}
 		}
-		if method == "request.intercept_after" && searchSupported(req.Model, req.RequestedModel) && req.ToFormat == "claude" {
+		if method == "request.intercept_after" && searchRouteSupported(req.Model, req.RequestedModel, req.ToFormat) {
 			req.Body = body
 			updated, reject := interceptSearchRequest(req)
 			if reject {

@@ -52,7 +52,11 @@ func hookedBody(t *testing.T, method string, request any) []byte {
 func activateSearch(t *testing.T, id, model string, body []byte) []byte {
 	t.Helper()
 	t.Cleanup(func() { releaseStream(id) })
-	return hookedBody(t, "request.intercept_after", requestIntercept{RequestID: id, SourceFormat: "openai-response", ToFormat: "claude", Model: model, Body: body})
+	format := "claude"
+	if deepSeekSearch(model, "") {
+		format = "openai"
+	}
+	return hookedBody(t, "request.intercept_after", requestIntercept{RequestID: id, SourceFormat: "openai-response", ToFormat: format, Model: model, Body: body})
 }
 
 func TestSearchRequestHistoryAndNamespaces(t *testing.T) {

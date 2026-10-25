@@ -45,7 +45,7 @@ func TestNativeCodexClientSearch(t *testing.T) {
 		model = "claude-opus-5-5"
 	}
 	if !searchSupported(model, "") {
-		t.Fatal("E2E model must be in the Claude search allowlist")
+		t.Fatal("E2E model must be in the search allowlist")
 	}
 	key, err := os.ReadFile(os.Getenv("CPA_CLIENT_KEY_FILE"))
 	if err != nil {
@@ -103,6 +103,9 @@ func TestNativeCodexClientSearch(t *testing.T) {
 	localKey := "compat-isolated-probe"
 	config := fmt.Sprintf("host: 127.0.0.1\nport: %d\nauth-dir: %q\napi-keys: [%q]\nrequest-retry: 0\nlogging-to-file: false\nrequest-log: false\nplugins:\n  enabled: true\n  dir: %q\n  configs:\n    codex-oss-compat:\n      enabled: true\nclaude-api-key:\n  - api-key: %q\n    base-url: http://127.0.0.1:8317\n    models:\n      - name: %q\n        alias: %q\n        is-compat: true\n", port, filepath.Join(dir, "auths"), localKey, filepath.Join(dir, "plugins"), strings.TrimSpace(string(key)), model, model)
 	configPath := filepath.Join(dir, "cpa.yaml")
+	if deepSeekSearch(model, "") {
+		config = strings.Split(config, "claude-api-key:")[0] + fmt.Sprintf("openai-compatibility:\n  - name: deepseek-probe\n    base-url: http://127.0.0.1:8317/v1\n    api-key-entries:\n      - api-key: %q\n    models:\n      - name: %q\n        alias: %q\n", strings.TrimSpace(string(key)), model, model)
+	}
 	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}

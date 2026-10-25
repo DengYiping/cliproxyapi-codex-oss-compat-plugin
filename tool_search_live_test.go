@@ -41,7 +41,7 @@ func TestLiveClientToolSearch(t *testing.T) {
 	}
 	for _, model := range models {
 		if !searchSupported(model, "") {
-			t.Fatal("live probe model is outside the Claude search allowlist")
+			t.Fatal("live probe model is outside the search allowlist")
 		}
 		t.Run(model, func(t *testing.T) {
 			markerValue := "compat-probe-read-only"
@@ -102,6 +102,10 @@ func TestLiveClientToolSearch(t *testing.T) {
 }
 
 func liveCPAResponse(t *testing.T, ctx context.Context, base string, key []byte, model, requestID string, body []byte, stream bool) []any {
+	return liveCPAResponseObserved(t, ctx, base, key, model, requestID, body, stream, nil)
+}
+
+func liveCPAResponseObserved(t *testing.T, ctx context.Context, base string, key []byte, model, requestID string, body []byte, stream bool, observe func(map[string]any)) []any {
 	t.Helper()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(base, "/")+"/v1/responses", bytes.NewReader(body))
 	if err != nil {
@@ -139,6 +143,11 @@ func liveCPAResponse(t *testing.T, ctx context.Context, base string, key []byte,
 		if json.Unmarshal(data, &response) != nil {
 			t.Fatal("invalid live nonstream response; body redacted")
 		}
+		if observe != nil {
+			var value map[string]any
+			_ = json.Unmarshal(data, &value)
+			observe(value)
+		}
 		return response.Output
 	}
 	var output []any
@@ -163,9 +172,64 @@ func liveCPAResponse(t *testing.T, ctx context.Context, base string, key []byte,
 		if event["type"] == "response.output_item.done" {
 			output = append(output, event["item"])
 		}
+		if event["type"] == "response.completed" && observe != nil {
+			if value, ok := event["response"].(map[string]any); ok {
+				observe(value)
+			}
+		}
 	}
 	if len(output) == 0 {
 		t.Fatal(fmt.Sprintf("no completed output items for %s; body redacted", model))
 	}
 	return output
+}
+
+// A positive cached-token count is upstream evidence, not just identical JSON.
+// The second request contains a new search result and a different user message,
+// so it cannot be satisfied by an exact-request response cache.
+func TestLiveDeepSeekPrefixCache(t *testing.T) {
+	if os.Getenv("COMPAT_LIVE_PROBE") != "1" {
+		t.Skip("opt-in synthetic DeepSeek prefix-cache probe")
+	}
+	key, err := os.ReadFile(os.Getenv("CPA_CLIENT_KEY_FILE"))
+	if err != nil {
+		t.Fatal("cannot read local client key")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	input := []any{map[string]any{"role": "user", "content": "Search for synthetic docs one with tool_search."}}
+	instructions := strings.Repeat("Synthetic cache fixture: preserve this stable prefix and only perform the requested tool search.\n", 200)
+	var cached float64
+	for turn := 0; turn < 2; turn++ {
+		id := fmt.Sprintf("cache-probe-%d", turn)
+		body := activateSearch(t, id, deepSeekModel, jsonBytes(t, map[string]any{
+			"model": deepSeekModel, "instructions": instructions, "tools": []any{searchDefinition()}, "input": input,
+			"tool_choice": map[string]any{"type": "tool_search"}, "max_output_tokens": 384, "reasoning": map[string]any{"effort": "none"},
+		}))
+		output := liveCPAResponseObserved(t, ctx, "http://127.0.0.1:8317", key, deepSeekModel, id, body, false, func(value map[string]any) {
+			usage, _ := value["usage"].(map[string]any)
+			t.Logf("synthetic turn %d usage: %s", turn, jsonBytes(t, usage))
+			details, _ := usage["input_tokens_details"].(map[string]any)
+			cached, _ = details["cached_tokens"].(float64)
+		})
+		var search map[string]any
+		for _, raw := range output {
+			if item, ok := raw.(map[string]any); ok && item["type"] == "tool_search_call" {
+				search = item
+				break
+			}
+		}
+		if search == nil {
+			t.Fatal("cache probe did not return client search")
+		}
+		input = append(input, output...)
+		input = append(input, map[string]any{"type": "tool_search_output", "execution": "client", "status": "completed", "call_id": search["call_id"], "tools": []any{discoveredNamespace("read")}}, map[string]any{"role": "user", "content": "Search for synthetic docs two with tool_search."})
+	}
+	if cached < 1024 {
+		if os.Getenv("COMPAT_REQUIRE_REPORTED_CACHE") == "1" {
+			t.Fatalf("upstream prefix reuse not demonstrated: cached_tokens=%.0f", cached)
+		}
+		t.Skipf("API usage did not demonstrate prefix reuse (cached_tokens=%.0f); inspect upstream prefix_cache counters, or enable usage reporting and COMPAT_REQUIRE_REPORTED_CACHE=1", cached)
+	}
+	t.Logf("upstream prefix reuse survived a new discovery result and user turn: cached_tokens=%.0f", cached)
 }
